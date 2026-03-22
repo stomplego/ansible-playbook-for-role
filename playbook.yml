@@ -1,8 +1,30 @@
 ---
-- name: Deploy ClickHouse, Vector and Lighthouse
-  hosts: all
+- name: Deploy Monitoring Stack (ClickHouse + Vector + Lighthouse)
+  hosts: localhost
   become: yes
+  connection: local
   gather_facts: yes
+
+  vars:
+    # Общие переменные
+    deployment_environment: production
+    
+    # ClickHouse переменные
+    clickhouse_version: "26.4.1.109"
+    clickhouse_http_port: 8123
+    
+    # Vector переменные (используем рабочую версию)
+    vector_version: "0.48.0"
+    vector_config_dir: /etc/vector
+    vector_source_type: demo_logs
+    vector_source_format: apache_common
+    vector_source_interval: 1
+    vector_sink_type: console
+    vector_sink_target: stdout
+    
+    # Lighthouse переменные
+    lighthouse_install_dir: /var/www/lighthouse
+    lighthouse_nginx_port: 8080
 
   pre_tasks:
     - name: Update apt cache
@@ -10,29 +32,116 @@
         update_cache: yes
         cache_valid_time: 3600
       changed_when: false
+      become: yes
+      tags: always
+
+    - name: Install common dependencies
+      apt:
+        name:
+          - curl
+          - wget
+          - gnupg
+          - ca-certificates
+        state: present
+      become: yes
+      tags: always
+
+    - name: Check disk space
+      shell: df / | tail -1 | awk '{print $4}'
+      register: disk_space
+      changed_when: false
+      tags: always
+
+    - name: Convert disk space to MB
+      set_fact:
+        disk_space_mb: "{{ (disk_space.stdout | int / 1024) | int }}"
+      tags: always
+
+    - name: Display disk space
+      debug:
+        msg: "Available disk space: {{ disk_space_mb }} MB"
+      tags: always
 
   roles:
     - role: clickhouse
-      tags: [clickhouse]
-    
+      tags: [clickhouse, monitoring]
+      when: disk_space_mb | default(0) > 500
+
     - role: vector
-      tags: [vector]
-    
+      tags: [vector, logging, monitoring]
+
     - role: lighthouse
-      tags: [lighthouse]
+      tags: [lighthouse, monitoring, web]
 
   post_tasks:
-    - name: Check if services are running
-      service:
-        name: "{{ item }}"
-        state: started
-      loop:
-        - clickhouse-server
-        - vector
-        - nginx
-      register: services_status
+    - name: Wait for ClickHouse to be ready
+      wait_for:
+        port: "{{ clickhouse_http_port }}"
+        delay: 5
+        timeout: 60
+      when: "'clickhouse' in ansible_play_roles"
       ignore_errors: yes
+      tags: clickhouse
 
-    - name: Display service status
+    - name: Wait for Lighthouse to be ready
+      wait_for:
+        port: "{{ lighthouse_nginx_port }}"
+        delay: 3
+        timeout: 30
+      when: "'lighthouse' in ansible_play_roles"
+      ignore_errors: yes
+      tags: lighthouse
+
+    - name: Verify ClickHouse
+      command: clickhouse-client --query "SELECT version()"
+      register: clickhouse_check
+      changed_when: false
+      ignore_errors: yes
+      when: "'clickhouse' in ansible_play_roles"
+      tags: clickhouse
+
+    - name: Show ClickHouse version
       debug:
-        var: services_status
+        msg: "ClickHouse version: {{ clickhouse_check.stdout }}"
+      when: clickhouse_check is success and "'clickhouse' in ansible_play_roles"
+      tags: clickhouse
+
+    - name: Check Lighthouse accessibility
+      uri:
+        url: "http://localhost:{{ lighthouse_nginx_port }}"
+        status_code: 200
+      register: lighthouse_check
+      ignore_errors: yes
+      when: "'lighthouse' in ansible_play_roles"
+      tags: lighthouse
+
+    - name: Deployment summary
+      debug:
+        msg:
+          - "=========================================="
+          - "DEPLOYMENT COMPLETED"
+          - "=========================================="
+          - "ClickHouse: http://localhost:{{ clickhouse_http_port }}"
+          - "Lighthouse: http://localhost:{{ lighthouse_nginx_port }}"
+          - "Vector: version {{ vector_version }}"
+          - "=========================================="
+      tags: always
+
+  handlers:
+    - name: reload nginx
+      systemd:
+        name: nginx
+        state: reloaded
+      become: yes
+
+    - name: restart vector
+      systemd:
+        name: vector
+        state: restarted
+      become: yes
+
+    - name: restart clickhouse
+      systemd:
+        name: clickhouse-server
+        state: restarted
+      become: yes
