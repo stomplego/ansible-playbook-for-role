@@ -1,0 +1,38 @@
+---
+- name: Deploy ClickHouse, Vector and Lighthouse
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  pre_tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      changed_when: false
+
+  roles:
+    - role: clickhouse
+      tags: [clickhouse]
+    
+    - role: vector
+      tags: [vector]
+    
+    - role: lighthouse
+      tags: [lighthouse]
+
+  post_tasks:
+    - name: Check if services are running
+      service:
+        name: "{{ item }}"
+        state: started
+      loop:
+        - clickhouse-server
+        - vector
+        - nginx
+      register: services_status
+      ignore_errors: yes
+
+    - name: Display service status
+      debug:
+        var: services_status
